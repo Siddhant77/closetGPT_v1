@@ -1,0 +1,5 @@
+data/embeddings/personal/personal_embeddings.pkl
+data/embeddings/polyvore/clip_embeddings.pkl
+data/datasets/polyvore/*
+data/images/polyvore/*.jpg
+
