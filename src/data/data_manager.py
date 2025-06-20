@@ -91,6 +91,10 @@ class DataManager:
             """)
         
         logger.info("Database tables initialized")
+
+    #
+    # CRUD helper functions for 'items' object/table
+    # 
     
     def add_item(self, 
                  item_id: str,
@@ -121,50 +125,33 @@ class DataManager:
         Returns:
             True if successful, False otherwise
         """
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
-                    INSERT OR REPLACE INTO items 
-                    (item_id, source, filename, category, color, style, formality, season, 
-                     embedding_path, metadata_json, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    item_id, source, filename, category, color, style, formality, season,
-                    embedding_path, json.dumps(metadata) if metadata else None,
-                    datetime.now().isoformat()
-                ))
-            return True
-        except Exception as e:
-            logger.error(f"Error adding item {item_id}: {e}")
-            return False
-    
-    def add_embedding(self, item_id: str, embedding: np.ndarray, model_name: str = "clip-vit-base-patch32") -> bool:
-        """
-        Add or update embedding for an item
-        
-        Args:
-            item_id: Item identifier
-            embedding: Numpy array embedding
-            model_name: Name of the model used
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO items 
+                        (item_id, source, filename, category, color, style, formality, season, 
+                         embedding_path, metadata_json, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        item_id, source, filename, category, color, style, formality, season,
+                        embedding_path, json.dumps(metadata) if metadata else None,
+                        datetime.now().isoformat()
+                    ))
+                return True
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    import time
+                    time.sleep(0.1 * (attempt + 1))  # Exponential backoff
+                    continue
+                else:
+                    logger.error(f"Error adding item {item_id}: {e}")
+                    return False
+            except Exception as e:
+                logger.error(f"Error adding item {item_id}: {e}")
+                return False
             
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            # Serialize numpy array
-            embedding_blob = pickle.dumps(embedding)
-            
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
-                    INSERT OR REPLACE INTO embeddings 
-                    (item_id, embedding_vector, model_name, created_at)
-                    VALUES (?, ?, ?, ?)
-                """, (item_id, embedding_blob, model_name, datetime.now().isoformat()))
-            return True
-        except Exception as e:
-            logger.error(f"Error adding embedding for {item_id}: {e}")
-            return False
-    
     def get_items(self, 
                   source: Optional[str] = None,
                   category: Optional[str] = None,
@@ -221,7 +208,235 @@ class DataManager:
         except Exception as e:
             logger.error(f"Error retrieving items: {e}")
             return []
+
+    def update_item(self, 
+                    item_id: str,
+                    **kwargs) -> bool:
+        """
+        Update an existing item's metadata
+        
+        Args:
+            item_id: Item identifier
+            **kwargs: Fields to update (category, color, style, formality, season, metadata, etc.)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if not kwargs:
+            logger.warning(f"No fields provided for updating item {item_id}")
+            return False
+        
+        # Build dynamic update query
+        valid_fields = {'source', 'filename', 'category', 'color', 'style', 'formality', 'season', 'embedding_path', 'metadata'}
+        update_fields = []
+        params = []
+        
+        for field, value in kwargs.items():
+            if field in valid_fields:
+                if field == 'metadata':
+                    update_fields.append("metadata_json = ?")
+                    params.append(json.dumps(value) if value else None)
+                else:
+                    update_fields.append(f"{field} = ?")
+                    params.append(value)
+        
+        if not update_fields:
+            logger.warning(f"No valid fields provided for updating item {item_id}")
+            return False
+        
+        update_fields.append("updated_at = ?")
+        params.append(datetime.now().isoformat())
+        params.append(item_id)  # For WHERE clause
+        
+        query = f"UPDATE items SET {', '.join(update_fields)} WHERE item_id = ?"
+        
+        try:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                cursor = conn.execute(query, params)
+                if cursor.rowcount > 0:
+                    logger.info(f"Successfully updated item {item_id}")
+                    return True
+                else:
+                    logger.warning(f"Item {item_id} not found for update")
+                    return False
+        except Exception as e:
+            logger.error(f"Error updating item {item_id}: {e}")
+            return False
     
+    def delete_item(self, item_id: str, delete_embedding: bool = True) -> bool:
+        """
+        Delete an item and optionally its embedding
+        
+        Args:
+            item_id: Item identifier
+            delete_embedding: Whether to also delete the embedding
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                cursor = conn.cursor()
+                
+                # Check if item exists
+                cursor.execute("SELECT COUNT(*) FROM items WHERE item_id = ?", (item_id,))
+                if cursor.fetchone()[0] == 0:
+                    logger.warning(f"Item {item_id} not found for deletion")
+                    return False
+                
+                # Delete embedding first (if requested)
+                if delete_embedding:
+                    cursor.execute("DELETE FROM embeddings WHERE item_id = ?", (item_id,))
+                    embedding_deleted = cursor.rowcount
+                    logger.info(f"Deleted {embedding_deleted} embedding(s) for item {item_id}")
+                
+                # Delete from outfits (remove item from any outfit combinations)
+                cursor.execute("SELECT outfit_id, item_ids FROM outfits")
+                outfits_to_update = []
+                outfits_to_delete = []
+                
+                for outfit_id, item_ids_json in cursor.fetchall():
+                    item_ids = json.loads(item_ids_json)
+                    if item_id in item_ids:
+                        item_ids.remove(item_id)
+                        if len(item_ids) < 2:  # Outfit needs at least 2 items
+                            outfits_to_delete.append(outfit_id)
+                        else:
+                            outfits_to_update.append((json.dumps(item_ids), outfit_id))
+                
+                # Update/delete affected outfits
+                for outfit_id in outfits_to_delete:
+                    cursor.execute("DELETE FROM outfits WHERE outfit_id = ?", (outfit_id,))
+                    logger.info(f"Deleted outfit {outfit_id} (insufficient items after removing {item_id})")
+                
+                for item_ids_json, outfit_id in outfits_to_update:
+                    cursor.execute("UPDATE outfits SET item_ids = ? WHERE outfit_id = ?", (item_ids_json, outfit_id))
+                    logger.info(f"Updated outfit {outfit_id} after removing item {item_id}")
+                
+                # Delete the item
+                cursor.execute("DELETE FROM items WHERE item_id = ?", (item_id,))
+                if cursor.rowcount > 0:
+                    logger.info(f"Successfully deleted item {item_id}")
+                    return True
+                else:
+                    logger.error(f"Failed to delete item {item_id}")
+                    return False
+                
+        except Exception as e:
+            logger.error(f"Error deleting item {item_id}: {e}")
+            return False
+        
+    #
+    # CRUD helper functions for 'embeddings' object/table
+    # 
+
+    def add_embedding(self, item_id: str, embedding: np.ndarray, model_name: str = "clip-vit-base-patch32") -> bool:
+        """
+        Add or update embedding for an item
+        
+        Args:
+            item_id: Item identifier
+            embedding: Numpy array embedding
+            model_name: Name of the model used
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Serialize numpy array
+                embedding_blob = pickle.dumps(embedding)
+                
+                with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO embeddings 
+                        (item_id, embedding_vector, model_name, created_at)
+                        VALUES (?, ?, ?, ?)
+                    """, (item_id, embedding_blob, model_name, datetime.now().isoformat()))
+                return True
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    import time
+                    time.sleep(0.1 * (attempt + 1))
+                    continue
+                else:
+                    logger.error(f"Error adding embedding for {item_id}: {e}")
+                    return False
+            except Exception as e:
+                logger.error(f"Error adding embedding for {item_id}: {e}")
+                return False
+        
+    def get_embeddings(self, item_ids: Optional[List[str]] = None) -> Dict[str, np.ndarray]:
+        """
+        Get embeddings for items
+        
+        Args:
+            item_ids: List of item IDs, or None for all embeddings
+            
+        Returns:
+            Dictionary mapping item_id to embedding array
+        """
+        query = "SELECT item_id, embedding_vector FROM embeddings"
+        params = []
+        
+        if item_ids:
+            placeholders = ",".join(["?"] * len(item_ids))
+            query += f" WHERE item_id IN ({placeholders})"
+            params = item_ids
+        
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute(query, params)
+                embeddings = {}
+                for item_id, embedding_blob in cursor.fetchall():
+                    embeddings[item_id] = pickle.loads(embedding_blob)
+                return embeddings
+        except Exception as e:
+            logger.error(f"Error retrieving embeddings: {e}")
+            return {}
+        
+    def update_embedding(self, item_id: str, embedding: np.ndarray, model_name: str = "clip-vit-base-patch32") -> bool:
+        """
+        Update an existing embedding (same as add_embedding with OR REPLACE)
+        
+        Args:
+            item_id: Item identifier
+            embedding: New embedding vector
+            model_name: Model name
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        success = self.add_embedding(item_id, embedding, model_name)
+        if success:
+            logger.info(f"Successfully updated embedding for item {item_id}")
+        return success
+    
+    def delete_embedding(self, item_id: str) -> bool:
+        """
+        Delete an embedding for an item
+        
+        Args:
+            item_id: Item identifier
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                cursor = conn.execute("DELETE FROM embeddings WHERE item_id = ?", (item_id,))
+                if cursor.rowcount > 0:
+                    logger.info(f"Successfully deleted embedding for item {item_id}")
+                    return True
+                else:
+                    logger.warning(f"No embedding found for item {item_id}")
+                    return False
+        except Exception as e:
+            logger.error(f"Error deleting embedding for {item_id}: {e}")
+            return False
+
+        
     def get_item_with_embedding(self, item_id: str) -> Optional[Dict]:
         """
         Get item data along with its embedding
@@ -266,36 +481,11 @@ class DataManager:
         except Exception as e:
             logger.error(f"Error retrieving item {item_id}: {e}")
             return None
-    
-    def get_embeddings(self, item_ids: Optional[List[str]] = None) -> Dict[str, np.ndarray]:
-        """
-        Get embeddings for items
         
-        Args:
-            item_ids: List of item IDs, or None for all embeddings
-            
-        Returns:
-            Dictionary mapping item_id to embedding array
-        """
-        query = "SELECT item_id, embedding_vector FROM embeddings"
-        params = []
-        
-        if item_ids:
-            placeholders = ",".join(["?"] * len(item_ids))
-            query += f" WHERE item_id IN ({placeholders})"
-            params = item_ids
-        
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute(query, params)
-                embeddings = {}
-                for item_id, embedding_blob in cursor.fetchall():
-                    embeddings[item_id] = pickle.loads(embedding_blob)
-                return embeddings
-        except Exception as e:
-            logger.error(f"Error retrieving embeddings: {e}")
-            return {}
-    
+    #
+    # CRUD helper functions for 'outfits' object/table
+    # 
+
     def add_outfit(self, 
                    outfit_id: str,
                    item_ids: List[str],
@@ -372,6 +562,208 @@ class DataManager:
         except Exception as e:
             logger.error(f"Error retrieving outfits: {e}")
             return []
+
+    def update_outfit(self, 
+                      outfit_id: str,
+                      item_ids: Optional[List[str]] = None,
+                      compatibility_score: Optional[float] = None,
+                      context: Optional[Dict] = None) -> bool:
+        """
+        Update an existing outfit
+        
+        Args:
+            outfit_id: Outfit identifier
+            item_ids: New list of item IDs (optional)
+            compatibility_score: New compatibility score (optional)
+            context: New context information (optional)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        update_fields = []
+        params = []
+        
+        if item_ids is not None:
+            update_fields.append("item_ids = ?")
+            params.append(json.dumps(item_ids))
+        
+        if compatibility_score is not None:
+            update_fields.append("compatibility_score = ?")
+            params.append(compatibility_score)
+        
+        if context is not None:
+            update_fields.append("context_json = ?")
+            params.append(json.dumps(context))
+        
+        if not update_fields:
+            logger.warning(f"No fields provided for updating outfit {outfit_id}")
+            return False
+        
+        query = f"UPDATE outfits SET {', '.join(update_fields)} WHERE outfit_id = ?"
+        params.append(outfit_id)
+        
+        try:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                cursor = conn.execute(query, params)
+                if cursor.rowcount > 0:
+                    logger.info(f"Successfully updated outfit {outfit_id}")
+                    return True
+                else:
+                    logger.warning(f"Outfit {outfit_id} not found for update")
+                    return False
+        except Exception as e:
+            logger.error(f"Error updating outfit {outfit_id}: {e}")
+            return False
+    
+    def delete_outfit(self, outfit_id: str) -> bool:
+        """
+        Delete an outfit
+        
+        Args:
+            outfit_id: Outfit identifier
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                cursor = conn.execute("DELETE FROM outfits WHERE outfit_id = ?", (outfit_id,))
+                if cursor.rowcount > 0:
+                    logger.info(f"Successfully deleted outfit {outfit_id}")
+                    return True
+                else:
+                    logger.warning(f"Outfit {outfit_id} not found for deletion")
+                    return False
+        except Exception as e:
+            logger.error(f"Error deleting outfit {outfit_id}: {e}")
+            return False
+        
+    #
+    # CRUD helper functions for 'users' object/table
+    # 
+
+    def add_user(self, user_id: str, name: Optional[str] = None, preferences: Optional[Dict] = None) -> bool:
+        """
+        Add a new user
+        
+        Args:
+            user_id: Unique user identifier
+            name: User's name
+            preferences: User preferences as dictionary
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO users (user_id, name, preferences_json, created_at)
+                    VALUES (?, ?, ?, ?)
+                """, (user_id, name, json.dumps(preferences) if preferences else None, datetime.now().isoformat()))
+                logger.info(f"Successfully added user {user_id}")
+                return True
+        except Exception as e:
+            logger.error(f"Error adding user {user_id}: {e}")
+            return False
+        
+    def get_user(self, user_id: str) -> Optional[Dict]:
+        """
+        Get user information
+        
+        Args:
+            user_id: User identifier
+            
+        Returns:
+            User dictionary or None if not found
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+                row = cursor.fetchone()
+                
+                if row:
+                    user = dict(row)
+                    if user['preferences_json']:
+                        user['preferences'] = json.loads(user['preferences_json'])
+                    else:
+                        user['preferences'] = {}
+                    del user['preferences_json']
+                    return user
+                return None
+        except Exception as e:
+            logger.error(f"Error retrieving user {user_id}: {e}")
+            return None
+
+    def update_user(self, user_id: str, name: Optional[str] = None, preferences: Optional[Dict] = None) -> bool:
+        """
+        Update user information
+        
+        Args:
+            user_id: User identifier
+            name: New name (optional)
+            preferences: New preferences (optional)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        update_fields = []
+        params = []
+        
+        if name is not None:
+            update_fields.append("name = ?")
+            params.append(name)
+        
+        if preferences is not None:
+            update_fields.append("preferences_json = ?")
+            params.append(json.dumps(preferences))
+        
+        if not update_fields:
+            logger.warning(f"No fields provided for updating user {user_id}")
+            return False
+        
+        query = f"UPDATE users SET {', '.join(update_fields)} WHERE user_id = ?"
+        params.append(user_id)
+        
+        try:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                cursor = conn.execute(query, params)
+                if cursor.rowcount > 0:
+                    logger.info(f"Successfully updated user {user_id}")
+                    return True
+                else:
+                    logger.warning(f"User {user_id} not found for update")
+                    return False
+        except Exception as e:
+            logger.error(f"Error updating user {user_id}: {e}")
+            return False
+    
+    def delete_user(self, user_id: str) -> bool:
+        """
+        Delete a user
+        
+        Args:
+            user_id: User identifier
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                cursor = conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+                if cursor.rowcount > 0:
+                    logger.info(f"Successfully deleted user {user_id}")
+                    return True
+                else:
+                    logger.warning(f"User {user_id} not found for deletion")
+                    return False
+        except Exception as e:
+            logger.error(f"Error deleting user {user_id}: {e}")
+            return False
+        
+    #
+    # Database statistics and import functions
+    #
     
     def get_stats(self) -> Dict:
         """Get database statistics"""
@@ -401,16 +793,22 @@ class DataManager:
         except Exception as e:
             logger.error(f"Error getting stats: {e}")
             return {}
+        
+    #
+    # Build mock database using Polyvore dataset
+    # 
     
     def import_polyvore_data(self, 
                             embeddings_file: str = "data/embeddings/polyvore/clip_embeddings.pkl",
-                            polyvore_json: str = "data/datasets/polyvore_outfits.json") -> int:
+                            polyvore_json: str = "data/datasets/polyvore_outfits.json",
+                            chunk_size: int = 5000) -> int:
         """
-        Import Polyvore dataset into database
+        Import Polyvore dataset into database using chunked processing
         
         Args:
             embeddings_file: Path to embeddings pickle file
             polyvore_json: Path to Polyvore outfit JSON file
+            chunk_size: Number of items to process in each chunk
             
         Returns:
             Number of items imported
@@ -421,55 +819,158 @@ class DataManager:
             with open(embeddings_file, 'rb') as f:
                 embeddings = pickle.load(f)
             
-            # Load Polyvore metadata if available
-            polyvore_metadata = {}
-            if Path(polyvore_json).exists():
-                logger.info("Loading Polyvore metadata...")
-                with open(polyvore_json, 'r') as f:
-                    polyvore_data = json.load(f)
-                    # Process Polyvore structure (this depends on the actual format)
-                    # For now, we'll create basic metadata from filenames
+            total_items = len(embeddings)
+            logger.info(f"Found {total_items:,} Polyvore items to import")
             
+            # Process in chunks to avoid resource exhaustion
             imported_count = 0
-            logger.info(f"Importing {len(embeddings)} Polyvore items...")
+            failed_count = 0
             
-            for image_path, embedding in embeddings.items():
-                # Extract item info from path
-                path_obj = Path(image_path)
-                filename = path_obj.name
-                
-                # Generate item_id from filename
-                item_id = f"polyvore_{path_obj.stem}"
-                
-                # Basic category detection from filename/path
-                category = self._detect_category_from_path(image_path)
-                
-                # Add item to database
-                success = self.add_item(
-                    item_id=item_id,
-                    source="polyvore",
-                    filename=filename,
-                    category=category,
-                    embedding_path=str(path_obj),
-                    metadata={"original_path": image_path}
-                )
-                
-                if success:
-                    # Add embedding
-                    self.add_embedding(item_id, embedding)
-                    imported_count += 1
-                
-                if imported_count % 1000 == 0:
-                    print(f"\rImported {imported_count} items...", end="", flush=True)
+            # Convert to list for chunking
+            embedding_items = list(embeddings.items())
             
-            print()  # New line
-            logger.info(f"Successfully imported {imported_count} Polyvore items")
+            for chunk_start in range(0, total_items, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, total_items)
+                chunk_items = embedding_items[chunk_start:chunk_end]
+                
+                logger.info(f"Processing chunk {chunk_start//chunk_size + 1}/{(total_items-1)//chunk_size + 1} "
+                           f"(items {chunk_start+1}-{chunk_end})")
+                
+                # Process this chunk
+                chunk_imported, chunk_failed = self._process_polyvore_chunk(chunk_items)
+                imported_count += chunk_imported
+                failed_count += chunk_failed
+                
+                print(f"Chunk complete: {chunk_imported}/{len(chunk_items)} successful")
+                print(f"Total progress: {imported_count:,}/{total_items:,} ({imported_count/total_items*100:.1f}%)")
+                
+                # Force garbage collection between chunks
+                import gc
+                gc.collect()
+            
+            logger.info(f"Import complete: {imported_count:,} successful, {failed_count:,} failed")
             return imported_count
             
         except Exception as e:
             logger.error(f"Error importing Polyvore data: {e}")
             return 0
     
+    #
+    # Private helper functions for processing Polyvore data in a chunk
+    #
+    def _process_polyvore_chunk(self, chunk_items: List[Tuple[str, np.ndarray]]) -> Tuple[int, int]:
+        """
+        Process a chunk of Polyvore items
+        
+        Args:
+            chunk_items: List of (image_path, embedding) tuples
+            
+        Returns:
+            Tuple of (successful_count, failed_count)
+        """
+        items_data = []
+        embeddings_data = []
+        
+        # Prepare data for batch insert
+        for image_path, embedding in chunk_items:
+            path_obj = Path(image_path)
+            filename = path_obj.name
+            item_id = f"polyvore_{path_obj.stem}"
+            category = self._detect_category_from_path(image_path)
+            
+            items_data.append((
+                item_id, "polyvore", filename, category, None, None,
+                "casual", "all", str(path_obj),
+                json.dumps({"original_path": image_path}),
+                datetime.now().isoformat()
+            ))
+            
+            embeddings_data.append((
+                item_id, pickle.dumps(embedding), "clip-vit-base-patch32",
+                datetime.now().isoformat()
+            ))
+        
+        # Insert with retry logic
+        return self._insert_chunk_with_retry(items_data, embeddings_data)
+    
+    #
+    # Private helper function for inserting a chunk with robust retry logic
+    #
+    def _insert_chunk_with_retry(self, items_data: List, embeddings_data: List) -> Tuple[int, int]:
+        """
+        Insert a chunk with robust retry logic
+        
+        Args:
+            items_data: List of item tuples
+            embeddings_data: List of embedding tuples
+            
+        Returns:
+            Tuple of (successful_count, failed_count)
+        """
+        max_retries = 5
+        successful = 0
+        failed = 0
+        
+        for attempt in range(max_retries):
+            try:
+                # Use a single transaction for the entire chunk
+                with sqlite3.connect(self.db_path, timeout=60.0) as conn:
+                    # Set WAL mode for better concurrency
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                    conn.execute("PRAGMA cache_size=10000")
+                    
+                    # Begin transaction
+                    conn.execute("BEGIN TRANSACTION")
+                    
+                    try:
+                        # Insert items
+                        conn.executemany("""
+                            INSERT OR IGNORE INTO items 
+                            (item_id, source, filename, category, color, style, formality, season, 
+                             embedding_path, metadata_json, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, items_data)
+                        
+                        # Insert embeddings
+                        conn.executemany("""
+                            INSERT OR IGNORE INTO embeddings 
+                            (item_id, embedding_vector, model_name, created_at)
+                            VALUES (?, ?, ?, ?)
+                        """, embeddings_data)
+                        
+                        # Commit transaction
+                        conn.execute("COMMIT")
+                        successful = len(items_data)
+                        break
+                        
+                    except Exception as e:
+                        conn.execute("ROLLBACK")
+                        raise e
+                        
+            except sqlite3.OperationalError as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    logger.warning(f"Database busy, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                    import time
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Failed to insert chunk after {max_retries} attempts: {e}")
+                    failed = len(items_data)
+                    break
+            except Exception as e:
+                logger.error(f"Unexpected error inserting chunk: {e}")
+                failed = len(items_data)
+                break
+        
+        return successful, failed
+    
+
+    #
+    # Private helper function for detecting category from image path. 
+    # (Not used as image path does not contain category info.)
+    #            
     def _detect_category_from_path(self, image_path: str) -> str:
         """
         Simple category detection from image path/filename
@@ -482,18 +983,24 @@ class DataManager:
         """
         path_lower = image_path.lower()
         
-        # Simple keyword matching
-        if any(word in path_lower for word in ['shirt', 'top', 'blouse', 'tee', 'sweater']):
+        # For Polyvore dataset, filenames are just numbers, so we can't detect category
+        # We'll need to use the Polyvore metadata JSON if available, or leave as 'unknown'
+        # This will be improved when we add the outfit compatibility model
+        
+        # Simple keyword matching for personal photos and other datasets
+        if any(word in path_lower for word in ['shirt', 'top', 'blouse', 'tee', 'sweater', 'tank']):
             return 'top'
-        elif any(word in path_lower for word in ['pant', 'jean', 'trouser', 'skirt', 'short']):
+        elif any(word in path_lower for word in ['pant', 'jean', 'trouser', 'skirt', 'short', 'bottom']):
             return 'bottom'
-        elif any(word in path_lower for word in ['shoe', 'boot', 'sneaker', 'sandal']):
+        elif any(word in path_lower for word in ['shoe', 'boot', 'sneaker', 'sandal', 'heel']):
             return 'shoes'
-        elif any(word in path_lower for word in ['jacket', 'coat', 'cardigan']):
+        elif any(word in path_lower for word in ['jacket', 'coat', 'cardigan', 'blazer']):
             return 'outerwear'
-        elif any(word in path_lower for word in ['bag', 'hat', 'belt', 'accessory']):
+        elif any(word in path_lower for word in ['bag', 'purse', 'hat', 'belt', 'accessory', 'jewelry', 'watch']):
             return 'accessory'
         else:
+            # For Polyvore numeric filenames, we'll categorize as 'unknown' for now
+            # This can be improved later with ML-based category detection
             return 'unknown'
 
 def setup_database_with_polyvore():
