@@ -367,6 +367,7 @@ class DataManager:
                 logger.error(f"Error adding embedding for {item_id}: {e}")
                 return False
     
+
     def get_embeddings_batch(self, item_ids: Optional[List[str]] = None, batch_size=900) -> Dict[str, np.ndarray]:
         """
         Get embeddings for items in batches. batch size is 900 to avoid SQLite's 999 variable limit.
@@ -399,7 +400,7 @@ class DataManager:
             """
             
             try:
-                with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                with sqlite3.connect(self.db_path) as conn:
                     cursor = conn.execute(query, batch_ids)
                     
                     for item_id, embedding_blob in cursor.fetchall():
