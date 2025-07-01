@@ -366,10 +366,10 @@ class DataManager:
             except Exception as e:
                 logger.error(f"Error adding embedding for {item_id}: {e}")
                 return False
-        
-    def get_embeddings(self, item_ids: Optional[List[str]] = None) -> Dict[str, np.ndarray]:
+    
+    def get_embeddings_batch(self, item_ids: Optional[List[str]] = None, batch_size=900) -> Dict[str, np.ndarray]:
         """
-        Get embeddings for items
+        Get embeddings for items in batches. batch size is 900 to avoid SQLite's 999 variable limit.
         
         Args:
             item_ids: List of item IDs, or None for all embeddings
@@ -377,24 +377,115 @@ class DataManager:
         Returns:
             Dictionary mapping item_id to embedding array
         """
-        query = "SELECT item_id, embedding_vector FROM embeddings"
-        params = []
+
+        embeddings = {}
         
-        if item_ids:
-            placeholders = ",".join(["?"] * len(item_ids))
-            query += f" WHERE item_id IN ({placeholders})"
-            params = item_ids
+        if not item_ids:
+            return embeddings
         
+        # Process in chunks to avoid SQL variable limit
+        for i in range(0, len(item_ids), batch_size):
+            batch_ids = item_ids[i:i + batch_size]
+            
+            # Build query with correct number of placeholders
+            placeholders = ','.join(['?'] * len(batch_ids))
+            
+            # Order by id DESC to get most recent embedding for duplicates
+            query = f"""
+                SELECT item_id, embedding_vector 
+                FROM embeddings 
+                WHERE item_id IN ({placeholders})
+                ORDER BY id DESC
+            """
+            
+            try:
+                with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                    cursor = conn.execute(query, batch_ids)
+                    
+                    for item_id, embedding_blob in cursor.fetchall():
+                        # Only store first occurrence (most recent due to ORDER BY)
+                        if item_id not in embeddings:
+                            try:
+                                import pickle
+                                embeddings[item_id] = pickle.loads(embedding_blob)
+                            except Exception as e:
+                                logger.warning(f"Failed to deserialize embedding for {item_id}: {e}")
+                            
+            except Exception as e:
+                logger.error(f"Error retrieving embeddings batch {i//batch_size}: {e}")
+                continue
+        
+        return embeddings
+    
+    # def get_embeddings(self, item_ids: Optional[List[str]] = None) -> Dict[str, np.ndarray]:
+    #     """
+    #     Get embeddings for items
+        
+    #     Args:
+    #         item_ids: List of item IDs, or None for all embeddings
+            
+    #     Returns:
+    #         Dictionary mapping item_id to embedding array
+    #     """
+    #     query = "SELECT item_id, embedding_vector FROM embeddings"
+    #     params = []
+        
+    #     if item_ids:
+    #         placeholders = ",".join(["?"] * len(item_ids))
+    #         query += f" WHERE item_id IN ({placeholders})"
+    #         params = item_ids
+        
+    #     try:
+    #         with sqlite3.connect(self.db_path) as conn:
+    #             cursor = conn.execute(query, params)
+    #             embeddings = {}
+    #             for item_id, embedding_blob in cursor.fetchall():
+    #                 embeddings[item_id] = pickle.loads(embedding_blob)
+    #             return embeddings
+    #     except Exception as e:
+    #         logger.error(f"Error retrieving embeddings: {e}")
+    #         return {}
+
+
+    def get_embeddings(self, item_ids: Optional[List[str]] = None) -> Dict[str, np.ndarray]:
+        """Get embeddings for multiple items (batched)"""
+        if isinstance(item_ids, str):
+            item_ids = [item_ids]
+        
+        return self.get_embeddings_batch(item_ids)
+
+    def cleanup_duplicate_embeddings(self) -> None:
+        """
+        Remove duplicate embeddings (keep most recent)
+        """
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute(query, params)
-                embeddings = {}
-                for item_id, embedding_blob in cursor.fetchall():
-                    embeddings[item_id] = pickle.loads(embedding_blob)
-                return embeddings
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                query = """
+                        SELECT item_id, COUNT(*) as count 
+                        FROM embeddings 
+                        GROUP BY item_id 
+                        HAVING COUNT(*) > 1
+                        """
+                cursor = conn.execute(query)
+                
+                duplicates = cursor.fetchall()
+                logger.info(f"Found {len(duplicates)} items with duplicate embeddings")
+            
+                for item_id, count in duplicates:
+                    # Keep only the most recent (highest id)
+                    cursor.execute("""
+                        DELETE FROM embeddings 
+                        WHERE item_id = ? AND id NOT IN (
+                            SELECT MAX(id) FROM embeddings WHERE item_id = ?
+                        )
+                    """, (item_id, item_id))
+                
+                conn.commit()
+                logger.info(f"Cleaned up duplicate embeddings")
+            
         except Exception as e:
-            logger.error(f"Error retrieving embeddings: {e}")
-            return {}
+            logger.error(f"Error cleaning up duplicates: {e}")
+            conn.rollback()
         
     def update_embedding(self, item_id: str, embedding: np.ndarray, model_name: str = "clip-vit-base-patch32") -> bool:
         """

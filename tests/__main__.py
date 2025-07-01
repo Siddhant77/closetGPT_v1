@@ -59,17 +59,35 @@ def run_all_tests():
 def run_specific_test_class(class_name):
     """Run a specific test class"""
     print(f"🧪 Running {class_name} tests...")
-    
+    suite = unittest.TestSuite()
     # Import the specific test class
-    if class_name == "TestCLIPEmbedder":
+    if class_name == "clip":
         from .test_clip_embedder import TestCLIPEmbedder
-        suite = unittest.TestLoader().loadTestsFromTestCase(TestCLIPEmbedder)
-    elif class_name == "TestDataManager":
-        from .test_data_manager import TestDataManager
-        suite = unittest.TestLoader().loadTestsFromTestCase(TestDataManager)
-    elif class_name == "TestIntegration":
+        suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCLIPEmbedder))
+    elif class_name == "database":
+        from .test_data_manager import TestDataManager, TestDataManagerProduction
+        suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestDataManager))
+        suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestDataManagerProduction))
+    elif class_name == "integration":
         from .test_integration import TestIntegration
-        suite = unittest.TestLoader().loadTestsFromTestCase(TestIntegration)
+        suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestIntegration))
+    elif class_name == "compatibility":
+        from .test_compatibility_engine import TestCompatibilityEngine, TestCompatibilityEngineWithPolyvoreData
+        suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCompatibilityEngine))
+        suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestCompatibilityEngineWithPolyvoreData))
+    elif class_name == "similarity":
+        from .test_similarity_engine import TestSimilarityEngine, TestSimilarityEngineWithPolyvoreData
+        suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestSimilarityEngine))
+        suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestSimilarityEngineWithPolyvoreData))
+    elif class_name == "recommendation":
+        from .test_recommendation_engine import TestRecommendationEngine, TestRecommendationEngineEdgeCases, TestRecommendationEngineWithPolyvoreData
+        suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestRecommendationEngine))
+        suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestRecommendationEngineEdgeCases))
+        suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestRecommendationEngineWithPolyvoreData))
+    elif class_name == "engines":
+        from .test_engines_integration import TestEnginesIntegration, TestEnginesWithPolyvoreIntegration
+        suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestEnginesIntegration))
+        suite.addTests(unittest.TestLoader().loadTestsFromTestCase(TestEnginesWithPolyvoreIntegration))
     else:
         print(f"❌ Unknown test class: {class_name}")
         return False

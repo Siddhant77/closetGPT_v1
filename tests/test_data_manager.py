@@ -133,6 +133,10 @@ class TestDataManagerBase(unittest.TestCase):
             
             # Embeddings should be substantial (512 floats ≈ 2KB when pickled)
             self.assertGreater(avg_embedding_size, 1000, "Embeddings seem too small")
+        
+        # Clean up test data
+        for item_id, _, _, _, _, _, _ in test_items:
+            self.manager.delete_item(item_id, delete_embedding=True)
             
         print(f"✅ Database integrity: {items_count} items, {embeddings_count} embeddings")
         print(f"   Average item size: {avg_item_size:.0f} bytes")
@@ -187,6 +191,10 @@ class TestDataManagerBase(unittest.TestCase):
         # Verify data in database
         concurrent_items = self.manager.get_items(source="concurrent_test")
         self.assertGreater(len(concurrent_items), 0, "No concurrent items found in database")
+
+        # clean up concurrent test data
+        for item in concurrent_items:
+            self.manager.delete_item(item['item_id'], delete_embedding=True)
         
         print(f"✅ Concurrent access: {results['successes']} successes, {results['failures']} failures")
         print(f"   Items in database: {len(concurrent_items)}")
@@ -296,7 +304,13 @@ class TestDataManagerBase(unittest.TestCase):
         self.assertEqual(complex_item['metadata']['empty_structures']['empty_list'], [])
         self.assertEqual(complex_item['metadata']['empty_structures']['empty_dict'], {})
         self.assertIsNone(complex_item['metadata']['empty_structures']['null_value'])
-        
+
+        # Remove test data
+        self.manager.delete_item("large_001", delete_embedding=True)
+        self.manager.delete_item("edge_001", delete_embedding=True)
+        self.manager.delete_item("complex_001", delete_embedding=True)
+        self.manager.delete_item(long_item_id, delete_embedding=True)
+
         print("✅ Large data handling: Large metadata, nested structures, edge cases, and complex data types handled correctly")
     
     def test_data_consistency_and_relationships(self):
@@ -353,6 +367,12 @@ class TestDataManagerBase(unittest.TestCase):
             # Verify update
             updated_item = self.manager.get_item_with_embedding(item_id)
             self.assertEqual(updated_item['color'], "updated_color")
+        
+        # clean up test data
+        self.manager.delete_outfit(outfit_id)
+        for i in range(4):
+            item_id = f"relationship_{i:03d}"
+            self.manager.delete_item(item_id, delete_embedding=True)
         
         print("✅ Data consistency: Relationships and cascade operations working correctly")
     
@@ -569,9 +589,9 @@ class TestDataManagerBase(unittest.TestCase):
         casual_tops = self.manager.get_items(category="top", formality="casual")
         if self.is_production_db:
             # In production, we might have more items, so just check we get some
-            self.assertEqual(len(tops), 78)
-            self.assertEqual(len(blue_items), 4)
-            self.assertGreater(len(casual_tops), 40)
+            self.assertEqual(len(tops), 5)
+            self.assertEqual(len(blue_items), 2)
+            self.assertGreaterEqual(len(casual_tops), 4)
             self.assertEqual(casual_tops[0]['item_id'], "large_001")
         else:
             # In test DB, we know we added 2 tops
@@ -579,6 +599,12 @@ class TestDataManagerBase(unittest.TestCase):
             self.assertEqual(len(blue_items), 2)        
             self.assertEqual(len(casual_tops), 1)
             self.assertEqual(casual_tops[0]['item_id'], "filter_001")
+
+        # Remove tests data
+        self.manager.delete_item("filter_001", delete_embedding=True)
+        self.manager.delete_item("filter_002", delete_embedding=True)
+        self.manager.delete_item("filter_003", delete_embedding=True)
+        self.manager.delete_item("filter_004", delete_embedding=True)
         
         
         print("✅ Filtering: Item filtering working correctly")
@@ -597,8 +623,8 @@ class TestDataManagerBase(unittest.TestCase):
             self.assertGreater(stats['total_items'], 250000)
             self.assertGreater(stats['total_embeddings'], 250000)
             self.assertGreaterEqual(stats['items_by_source']['test'], 5)
-            self.assertGreater(stats['items_by_category']['top'], 70)
-            self.assertGreater(stats['items_by_category']['bottom'], 40)
+            self.assertGreaterEqual(stats['items_by_category']['top'], 5)
+            self.assertGreaterEqual(stats['items_by_category']['bottom'], 3)
         else:
             # In test DB, we know we added 5 items
             self.assertEqual(stats['total_items'], 5)
@@ -606,6 +632,10 @@ class TestDataManagerBase(unittest.TestCase):
             self.assertEqual(stats['items_by_source']['test'], 5)
             self.assertEqual(stats['items_by_category']['top'], 3)
             self.assertEqual(stats['items_by_category']['bottom'], 2)
+        
+        # Remove test data
+        for i in range(5):
+            self.manager.delete_item(f"stats_{i}", delete_embedding=True)
         
         print("✅ Statistics: Database statistics generated correctly")
     
@@ -701,6 +731,10 @@ class TestDataManagerBase(unittest.TestCase):
             """)
             joined_count = cursor.fetchone()[0]
             self.assertEqual(joined_count, embedding_count)
+
+        # Clean up test data
+        for item_id, _, _, _, _, _, _ in test_data:
+            self.manager.delete_item(item_id, delete_embedding=True)
         
         print(f"✅ Database Analysis:")
         print(f"   Tables: {table_stats}")
@@ -763,6 +797,11 @@ class TestDataManagerBase(unittest.TestCase):
         self.assertLess(category_query_time, 1.0, f"Category query too slow: {category_query_time:.2f}s")
         self.assertLess(source_query_time, 1.0, f"Source query too slow: {source_query_time:.2f}s")
         self.assertLess(embedding_query_time, 1.0, f"Embedding query too slow: {embedding_query_time:.2f}s")
+
+        #remove test data
+        for i in range(batch_size):
+            item_id = f"perf_{i:04d}"
+            self.manager.delete_item(item_id, delete_embedding=True)
         
         print(f"✅ Performance Tests:")
         print(f"   Bulk insert ({batch_size} items): {bulk_insert_time:.2f}s")
